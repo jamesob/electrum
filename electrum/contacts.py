@@ -27,14 +27,16 @@ from dns.exception import DNSException
 
 from . import bitcoin
 from . import dnssec
-from .util import export_meta, import_meta, print_error, to_string
+from .util import read_json_file, write_json_file, to_string
+from .logging import Logger
 
 
-class Contacts(dict):
+class Contacts(dict, Logger):
 
-    def __init__(self, storage):
-        self.storage = storage
-        d = self.storage.get('contacts', {})
+    def __init__(self, db):
+        Logger.__init__(self)
+        self.db = db
+        d = self.db.get('contacts', {})
         try:
             self.update(d)
         except:
@@ -47,17 +49,16 @@ class Contacts(dict):
                 self[n] = ('address', k)
 
     def save(self):
-        self.storage.put('contacts', dict(self))
+        self.db.put('contacts', dict(self))
 
     def import_file(self, path):
-        import_meta(path, self._validate, self.load_meta)
-
-    def load_meta(self, data):
+        data = read_json_file(path)
+        data = self._validate(data)
         self.update(data)
         self.save()
 
-    def export_file(self, filename):
-        export_meta(self, filename)
+    def export_file(self, path):
+        write_json_file(path, self)
 
     def __setitem__(self, key, value):
         dict.__setitem__(self, key, value)
@@ -99,7 +100,7 @@ class Contacts(dict):
         try:
             records, validated = dnssec.query(url, dns.rdatatype.TXT)
         except DNSException as e:
-            print_error(f'Error resolving openalias: {repr(e)}')
+            self.logger.info(f'Error resolving openalias: {repr(e)}')
             return None
         prefix = 'btc'
         for record in records:

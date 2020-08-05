@@ -89,21 +89,31 @@ class FxDialog(Factory.Popup):
         self.config = config
         self.callback = callback
         self.fx = self.app.fx
-        self.has_history_rates = self.fx.get_history_config(default=True)
+        if self.fx.get_history_config(allow_none=True) is None:
+            # If nothing is set, force-enable it. (Note that as fiat rates itself
+            # are disabled by default, it is enough to set this here. If they
+            # were enabled by default, this would be too late.)
+            self.fx.set_history_config(True)
+        self.has_history_rates = self.fx.get_history_config()
 
         Factory.Popup.__init__(self)
         self.add_currencies()
 
     def add_exchanges(self):
+        ex = self.ids.exchanges
         if self.fx.is_enabled():
             exchanges = sorted(self.fx.get_exchanges_by_ccy(self.fx.get_currency(), self.has_history_rates))
             mx = self.fx.exchange.name()
+            if mx in exchanges:
+                ex.text = mx
+            elif exchanges:
+                ex.text = exchanges[0]
+            else:
+                ex.text = ''
         else:
             exchanges = []
-            mx = ''
-        ex = self.ids.exchanges
+            ex.text = ''
         ex.values = exchanges
-        ex.text = (mx if mx in exchanges else exchanges[0]) if self.fx.is_enabled() else ''
 
     def on_exchange(self, text):
         if not text:

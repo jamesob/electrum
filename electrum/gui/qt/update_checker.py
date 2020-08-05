@@ -8,16 +8,18 @@ from distutils.version import StrictVersion
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QLabel, QProgressBar,
-                             QHBoxLayout, QPushButton)
+                             QHBoxLayout, QPushButton, QDialog)
 
 from electrum import version
 from electrum import constants
 from electrum import ecc
 from electrum.i18n import _
-from electrum.util import PrintError, make_aiohttp_session
+from electrum.util import make_aiohttp_session
+from electrum.logging import Logger
+from electrum.network import Network
 
 
-class UpdateCheck(QWidget, PrintError):
+class UpdateCheck(QDialog, Logger):
     url = "https://electrum.org/version"
     download_url = "https://electrum.org/#download"
 
@@ -25,9 +27,8 @@ class UpdateCheck(QWidget, PrintError):
         "13xjmVAB1EATPP8RshTE8S8sNwwSUM9p1P",
     )
 
-    def __init__(self, main_window, latest_version=None):
-        self.main_window = main_window
-        QWidget.__init__(self)
+    def __init__(self, *, latest_version=None):
+        QDialog.__init__(self)
         self.setWindowTitle('Electrum - ' + _('Update Check'))
         self.content = QVBoxLayout()
         self.content.setContentsMargins(*[10]*4)
@@ -53,7 +54,7 @@ class UpdateCheck(QWidget, PrintError):
 
         self.update_view(latest_version)
 
-        self.update_check_thread = UpdateCheckThread(self.main_window)
+        self.update_check_thread = UpdateCheckThread()
         self.update_check_thread.checked.connect(self.on_version_retrieved)
         self.update_check_thread.failed.connect(self.on_retrieval_failed)
         self.update_check_thread.start()
@@ -92,16 +93,19 @@ class UpdateCheck(QWidget, PrintError):
             self.detail_label.setText(_("Please wait while Electrum checks for available updates."))
 
 
-class UpdateCheckThread(QThread, PrintError):
+class UpdateCheckThread(QThread, Logger):
     checked = pyqtSignal(object)
     failed = pyqtSignal()
 
-    def __init__(self, main_window):
-        super().__init__()
-        self.main_window = main_window
+    def __init__(self):
+        QThread.__init__(self)
+        Logger.__init__(self)
+        self.network = Network.get_instance()
 
     async def get_update_info(self):
-        async with make_aiohttp_session(proxy=self.main_window.network.proxy) as session:
+        # note: Use long timeout here as it is not critical that we get a response fast,
+        #       and it's bad not to get an update notification just because we did not wait enough.
+        async with make_aiohttp_session(proxy=self.network.proxy, timeout=120) as session:
             async with session.get(UpdateCheck.url) as result:
                 signed_version_dict = await result.json(content_type=None)
                 # example signed_version_dict:
@@ -120,22 +124,20 @@ class UpdateCheckThread(QThread, PrintError):
                     msg = version_num.encode('utf-8')
                     if ecc.verify_message_with_address(address=address, sig65=sig, message=msg,
                                                        net=constants.BitcoinMainnet):
-                        self.print_error(f"valid sig for version announcement '{version_num}' from address '{address}'")
+                        self.logger.info(f"valid sig for version announcement '{version_num}' from address '{address}'")
                         break
                 else:
                     raise Exception('no valid signature for version announcement')
                 return StrictVersion(version_num.strip())
 
     def run(self):
-        network = self.main_window.network
-        if not network:
+        if not self.network:
             self.failed.emit()
             return
         try:
-            update_info = asyncio.run_coroutine_threadsafe(self.get_update_info(), network.asyncio_loop).result()
+            update_info = asyncio.run_coroutine_threadsafe(self.get_update_info(), self.network.asyncio_loop).result()
         except Exception as e:
-            #self.print_error(traceback.format_exc())
-            self.print_error(f"got exception: '{repr(e)}'")
+            self.logger.info(f"got exception: '{repr(e)}'")
             self.failed.emit()
         else:
             self.checked.emit(update_info)

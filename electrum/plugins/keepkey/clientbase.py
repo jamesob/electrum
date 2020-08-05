@@ -1,15 +1,19 @@
 import time
 from struct import pack
+from typing import Optional
 
 from electrum import ecc
 from electrum.i18n import _
-from electrum.util import PrintError, UserCancelled
+from electrum.util import UserCancelled
 from electrum.keystore import bip39_normalize_passphrase
 from electrum.bip32 import BIP32Node, convert_bip32_path_to_list_of_uint32
+from electrum.logging import Logger
+from electrum.plugins.hw_wallet.plugin import HardwareClientBase, HardwareHandlerBase
 
 
 class GuiMixin(object):
     # Requires: self.proto, self.device
+    handler: Optional[HardwareHandlerBase]
 
     messages = {
         3: _("Confirm the transaction output on your {} device"),
@@ -43,6 +47,7 @@ class GuiMixin(object):
         return self.proto.ButtonAck()
 
     def callback_PinMatrixRequest(self, msg):
+        show_strength = True
         if msg.type == 2:
             msg = _("Enter a new PIN for your {}:")
         elif msg.type == 3:
@@ -50,7 +55,8 @@ class GuiMixin(object):
                      "NOTE: the positions of the numbers have changed!"))
         else:
             msg = _("Enter your current {} PIN:")
-        pin = self.handler.get_pin(msg.format(self.device))
+            show_strength = False
+        pin = self.handler.get_pin(msg.format(self.device), show_strength=show_strength)
         if len(pin) > 9:
             self.handler.show_error(_('The PIN cannot be longer than 9 characters.'))
             pin = ''  # to cancel below
@@ -93,10 +99,11 @@ class GuiMixin(object):
         return self.proto.CharacterAck(**char_info)
 
 
-class KeepKeyClientBase(GuiMixin, PrintError):
+class KeepKeyClientBase(HardwareClientBase, GuiMixin, Logger):
 
     def __init__(self, handler, plugin, proto):
         assert hasattr(self, 'tx_api')  # ProtocolMixin already constructed?
+        HardwareClientBase.__init__(self, plugin=plugin)
         self.proto = proto
         self.device = plugin.device
         self.handler = handler
@@ -104,17 +111,19 @@ class KeepKeyClientBase(GuiMixin, PrintError):
         self.types = plugin.types
         self.msg = None
         self.creating_wallet = False
+        Logger.__init__(self)
         self.used()
 
     def __str__(self):
         return "%s/%s" % (self.label(), self.features.device_id)
 
     def label(self):
-        '''The name given by the user to the device.'''
         return self.features.label
 
+    def get_soft_device_id(self):
+        return self.features.device_id
+
     def is_initialized(self):
-        '''True if initialized, False if wiped.'''
         return self.features.initialized
 
     def is_pairable(self):
@@ -137,7 +146,7 @@ class KeepKeyClientBase(GuiMixin, PrintError):
     def timeout(self, cutoff):
         '''Time out the client if the last operation was before cutoff.'''
         if self.last_operation < cutoff:
-            self.print_error("timed out")
+            self.logger.info("timed out")
             self.clear_session()
 
     @staticmethod
@@ -190,13 +199,13 @@ class KeepKeyClientBase(GuiMixin, PrintError):
     def clear_session(self):
         '''Clear the session to force pin (and passphrase if enabled)
         re-entry.  Does not leak exceptions.'''
-        self.print_error("clear session:", self)
+        self.logger.info(f"clear session: {self}")
         self.prevent_timeouts()
         try:
             super(KeepKeyClientBase, self).clear_session()
         except BaseException as e:
             # If the device was removed it has the same effect...
-            self.print_error("clear_session: ignoring error", str(e))
+            self.logger.info(f"clear_session: ignoring error {e}")
 
     def get_public_node(self, address_n, creating):
         self.creating_wallet = creating
@@ -204,7 +213,7 @@ class KeepKeyClientBase(GuiMixin, PrintError):
 
     def close(self):
         '''Called when Our wallet was closed or the device removed.'''
-        self.print_error("closing client")
+        self.logger.info("closing client")
         self.clear_session()
         # Release the device
         self.transport.close()

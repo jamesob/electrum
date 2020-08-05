@@ -29,6 +29,7 @@ import base64
 from functools import partial
 import traceback
 import sys
+from typing import Set
 
 import smtplib
 import imaplib
@@ -41,19 +42,24 @@ from PyQt5.QtCore import QObject, pyqtSignal, QThread
 from PyQt5.QtWidgets import (QVBoxLayout, QLabel, QGridLayout, QLineEdit,
                              QInputDialog)
 
+from electrum.gui.qt.util import (EnterButton, Buttons, CloseButton, OkButton,
+                                  WindowModalDialog, get_parent_main_window)
+from electrum.gui.qt.main_window import ElectrumWindow
+
 from electrum.plugin import BasePlugin, hook
 from electrum.paymentrequest import PaymentRequest
 from electrum.i18n import _
-from electrum.util import PrintError
-from ...gui.qt.util import (EnterButton, Buttons, CloseButton, OkButton,
-                                  WindowModalDialog, get_parent_main_window)
+from electrum.logging import Logger
+from electrum.wallet import Abstract_Wallet
+from electrum.invoices import OnchainInvoice
 
 
-class Processor(threading.Thread, PrintError):
+class Processor(threading.Thread, Logger):
     polling_interval = 5*60
 
     def __init__(self, imap_server, username, password, callback):
         threading.Thread.__init__(self)
+        Logger.__init__(self)
         self.daemon = True
         self.username = username
         self.password = password
@@ -90,7 +96,7 @@ class Processor(threading.Thread, PrintError):
                 self.M = imaplib.IMAP4_SSL(self.imap_server)
                 self.M.login(self.username, self.password)
             except BaseException as e:
-                self.print_error('connecting failed: {}'.format(repr(e)))
+                self.logger.info(f'connecting failed: {repr(e)}')
                 self.connect_wait *= 2
             else:
                 self.reset_connect_wait()
@@ -99,7 +105,7 @@ class Processor(threading.Thread, PrintError):
                 try:
                     self.poll()
                 except BaseException as e:
-                    self.print_error('polling failed: {}'.format(repr(e)))
+                    self.logger.info(f'polling failed: {repr(e)}')
                     break
                 time.sleep(self.polling_interval)
             time.sleep(random.randint(0, self.connect_wait))
@@ -120,7 +126,7 @@ class Processor(threading.Thread, PrintError):
             s.sendmail(self.username, [recipient], msg.as_string())
             s.quit()
         except BaseException as e:
-            self.print_error(e)
+            self.logger.info(e)
 
 
 class QEmailSignalObject(QObject):
@@ -148,10 +154,10 @@ class Plugin(BasePlugin):
             self.processor.start()
         self.obj = QEmailSignalObject()
         self.obj.email_new_invoice_signal.connect(self.new_invoice)
-        self.wallets = set()
+        self.wallets = set()  # type: Set[Abstract_Wallet]
 
     def on_receive(self, pr_str):
-        self.print_error('received payment request')
+        self.logger.info('received payment request')
         self.pr = PaymentRequest(pr_str)
         self.obj.email_new_invoice_signal.emit()
 
@@ -164,8 +170,9 @@ class Plugin(BasePlugin):
         self.wallets -= {wallet}
 
     def new_invoice(self):
+        invoice = OnchainInvoice.from_bip70_payreq(self.pr)
         for wallet in self.wallets:
-            wallet.invoices.add(self.pr)
+            wallet.save_invoice(invoice)
         #main_window.invoice_list.update()
 
     @hook
@@ -173,28 +180,31 @@ class Plugin(BasePlugin):
         window = get_parent_main_window(menu)
         menu.addAction(_("Send via e-mail"), lambda: self.send(window, addr))
 
-    def send(self, window, addr):
+    def send(self, window: ElectrumWindow, addr):
         from electrum import paymentrequest
-        r = window.wallet.receive_requests.get(addr)
-        message = r.get('memo', '')
-        if r.get('signature'):
-            pr = paymentrequest.serialize_request(r)
+        req = window.wallet.receive_requests.get(addr)
+        if not isinstance(req, OnchainInvoice):
+            window.show_error("Only on-chain requests are supported.")
+            return
+        message = req.message
+        if req.bip70:
+            payload = bytes.fromhex(req.bip70)
         else:
-            pr = paymentrequest.make_request(self.config, r)
-        if not pr:
+            pr = paymentrequest.make_request(self.config, req)
+            payload = pr.SerializeToString()
+        if not payload:
             return
         recipient, ok = QInputDialog.getText(window, 'Send request', 'Email invoice to:')
         if not ok:
             return
         recipient = str(recipient)
-        payload = pr.SerializeToString()
-        self.print_error('sending mail to', recipient)
+        self.logger.info(f'sending mail to {recipient}')
         try:
             # FIXME this runs in the GUI thread and blocks it...
             self.processor.send(recipient, message, payload)
         except BaseException as e:
-            traceback.print_exc(file=sys.stderr)
-            window.show_message(str(e))
+            self.logger.exception('')
+            window.show_message(repr(e))
         else:
             window.show_message(_('Request sent.'))
 
@@ -267,4 +277,4 @@ class CheckConnectionThread(QThread):
             conn = imaplib.IMAP4_SSL(self.server)
             conn.login(self.username, self.password)
         except BaseException as e:
-            self.connection_error_signal.emit(str(e))
+            self.connection_error_signal.emit(repr(e))

@@ -137,7 +137,7 @@ class CharacterDialog(WindowModalDialog):
 class QtHandler(QtHandlerBase):
 
     char_signal = pyqtSignal(object)
-    pin_signal = pyqtSignal(object)
+    pin_signal = pyqtSignal(object, object)
     close_char_dialog_signal = pyqtSignal()
 
     def __init__(self, win, pin_matrix_widget_class, device):
@@ -162,17 +162,17 @@ class QtHandler(QtHandlerBase):
             self.character_dialog.accept()
             self.character_dialog = None
 
-    def get_pin(self, msg):
+    def get_pin(self, msg, *, show_strength=True):
         self.done.clear()
-        self.pin_signal.emit(msg)
+        self.pin_signal.emit(msg, show_strength)
         self.done.wait()
         return self.response
 
-    def pin_dialog(self, msg):
+    def pin_dialog(self, msg, show_strength):
         # Needed e.g. when resetting a device
         self.clear_dialog()
         dialog = WindowModalDialog(self.top_level_window(), _("Enter PIN"))
-        matrix = self.pin_matrix_widget_class()
+        matrix = self.pin_matrix_widget_class(show_strength)
         vbox = QVBoxLayout()
         vbox.addWidget(QLabel(msg))
         vbox.addWidget(matrix)
@@ -195,9 +195,6 @@ class QtPlugin(QtPluginBase):
     #   icon_file
     #   pin_matrix_widget_class
 
-    def create_handler(self, window):
-        return QtHandler(window, self.pin_matrix_widget_class(), self.device)
-
     @only_hook_if_libraries_available
     @hook
     def receive_menu(self, menu, addrs, wallet):
@@ -211,9 +208,13 @@ class QtPlugin(QtPluginBase):
                 menu.addAction(_("Show on {}").format(device_name), show_address)
 
     def show_settings_dialog(self, window, keystore):
-        device_id = self.choose_device(window, keystore)
-        if device_id:
-            SettingsDialog(window, self, keystore, device_id).exec_()
+        def connect():
+            device_id = self.choose_device(window, keystore)
+            return device_id
+        def show_dialog(device_id):
+            if device_id:
+                SettingsDialog(window, self, keystore, device_id).exec_()
+        keystore.thread.add(connect, on_success=show_dialog)
 
     def request_trezor_init_settings(self, wizard, method, device):
         vbox = QVBoxLayout()
@@ -302,6 +303,9 @@ class Plugin(KeepKeyPlugin, QtPlugin):
     icon_paired = "keepkey.png"
     icon_unpaired = "keepkey_unpaired.png"
 
+    def create_handler(self, window):
+        return QtHandler(window, self.pin_matrix_widget_class(), self.device)
+
     @classmethod
     def pin_matrix_widget_class(self):
         from keepkeylib.qt.pinmatrix import PinMatrixWidget
@@ -322,7 +326,6 @@ class SettingsDialog(WindowModalDialog):
         config = devmgr.config
         handler = keystore.handler
         thread = keystore.thread
-        hs_rows, hs_cols = (64, 128)
 
         def invoke_client(method, *args, **kw_args):
             unpair_after = kw_args.pop('unpair_after', False)
@@ -395,27 +398,6 @@ class SettingsDialog(WindowModalDialog):
             if not self.question(msg, title=title):
                 return
             invoke_client('toggle_passphrase', unpair_after=currently_enabled)
-
-        def change_homescreen():
-            from PIL import Image  # FIXME
-            dialog = QFileDialog(self, _("Choose Homescreen"))
-            filename, __ = dialog.getOpenFileName()
-            if filename:
-                im = Image.open(str(filename))
-                if im.size != (hs_cols, hs_rows):
-                    raise Exception('Image must be 64 x 128 pixels')
-                im = im.convert('1')
-                pix = im.load()
-                img = ''
-                for j in range(hs_rows):
-                    for i in range(hs_cols):
-                        img += '1' if pix[i, j] else '0'
-                img = ''.join(chr(int(img[i:i + 8], 2))
-                              for i in range(0, len(img), 8))
-                invoke_client('change_homescreen', img)
-
-        def clear_homescreen():
-            invoke_client('change_homescreen', '\x00')
 
         def set_pin():
             invoke_client('set_pin', remove=False)

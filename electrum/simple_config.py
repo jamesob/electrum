@@ -3,46 +3,47 @@ import threading
 import time
 import os
 import stat
+import ssl
 from decimal import Decimal
 from typing import Union, Optional
 from numbers import Real
 
 from copy import deepcopy
+from aiorpcx import NetAddress
 
 from . import util
-from .util import (user_dir, print_error, PrintError, make_dir,
-                   NoDynamicFeeEstimates, format_fee_satoshis, quantize_feerate)
+from . import constants
+from .util import base_units, base_unit_name_to_decimal_point, decimal_point_to_base_unit_name, UnknownBaseUnit, DECIMAL_POINT_DEFAULT
+from .util import format_satoshis, format_fee_satoshis
+from .util import user_dir, make_dir, NoDynamicFeeEstimates, quantize_feerate
 from .i18n import _
+from .logging import get_logger, Logger
+
 
 FEE_ETA_TARGETS = [25, 10, 5, 2]
 FEE_DEPTH_TARGETS = [10000000, 5000000, 2000000, 1000000, 500000, 200000, 100000]
+FEE_LN_ETA_TARGET = 2  # note: make sure the network is asking for estimates for this target
 
 # satoshi per kbyte
 FEERATE_MAX_DYNAMIC = 1500000
 FEERATE_WARNING_HIGH_FEE = 600000
 FEERATE_FALLBACK_STATIC_FEE = 150000
 FEERATE_DEFAULT_RELAY = 1000
+FEERATE_MAX_RELAY = 50000
 FEERATE_STATIC_VALUES = [1000, 2000, 5000, 10000, 20000, 30000,
                          50000, 70000, 100000, 150000, 200000, 300000]
+FEERATE_REGTEST_HARDCODED = 180000  # for eclair compat
+
+FEE_RATIO_HIGH_WARNING = 0.05  # warn user if fee/amount for on-chain tx is higher than this
 
 
-config = None
-
-
-def get_config():
-    global config
-    return config
-
-
-def set_config(c):
-    global config
-    config = c
+_logger = get_logger(__name__)
 
 
 FINAL_CONFIG_VERSION = 3
 
 
-class SimpleConfig(PrintError):
+class SimpleConfig(Logger):
     """
     The SimpleConfig class is responsible for handling operations involving
     configuration files.
@@ -55,9 +56,10 @@ class SimpleConfig(PrintError):
 
     def __init__(self, options=None, read_user_config_function=None,
                  read_user_dir_function=None):
-
         if options is None:
             options = {}
+
+        Logger.__init__(self)
 
         # This lock needs to be acquired for updating and reading the config in
         # a thread-safe way.
@@ -90,6 +92,8 @@ class SimpleConfig(PrintError):
             # avoid new config getting upgraded
             self.user_config = {'config_version': FINAL_CONFIG_VERSION}
 
+        self._not_modifiable_keys = set()
+
         # config "upgrade" - CLI options
         self.rename_config_keys(
             self.cmdline_options, {'auto_cycle': 'auto_connect'}, True)
@@ -98,8 +102,15 @@ class SimpleConfig(PrintError):
         if self.requires_upgrade():
             self.upgrade()
 
-        # Make a singleton instance of 'self'
-        set_config(self)
+        self._check_dependent_keys()
+
+        # units and formatting
+        self.decimal_point = self.get('decimal_point', DECIMAL_POINT_DEFAULT)
+        try:
+            decimal_point_to_base_unit_name(self.decimal_point)
+        except UnknownBaseUnit:
+            self.decimal_point = DECIMAL_POINT_DEFAULT
+        self.num_zeros = int(self.get('num_zeros', 0))
 
     def electrum_path(self):
         # Read electrum_path from command line
@@ -119,7 +130,7 @@ class SimpleConfig(PrintError):
             path = os.path.join(path, 'simnet')
             make_dir(path, allow_symlink=False)
 
-        self.print_error("electrum directory", path)
+        self.logger.info(f"electrum directory {path}")
         return path
 
     def rename_config_keys(self, config, keypairs, deprecation_warning=False):
@@ -130,21 +141,21 @@ class SimpleConfig(PrintError):
                 if new_key not in config:
                     config[new_key] = config[old_key]
                     if deprecation_warning:
-                        self.print_stderr('Note that the {} variable has been deprecated. '
-                                     'You should use {} instead.'.format(old_key, new_key))
+                        self.logger.warning('Note that the {} variable has been deprecated. '
+                                            'You should use {} instead.'.format(old_key, new_key))
                 del config[old_key]
                 updated = True
         return updated
 
     def set_key(self, key, value, save=True):
         if not self.is_modifiable(key):
-            self.print_stderr("Warning: not changing config key '%s' set on the command line" % key)
+            self.logger.warning(f"not changing config key '{key}' set on the command line")
             return
         try:
             json.dumps(key)
             json.dumps(value)
         except:
-            self.print_error(f"json error: cannot save {repr(key)} ({repr(value)})")
+            self.logger.info(f"json error: cannot save {repr(key)} ({repr(value)})")
             return
         self._set_key_in_user_config(key, value, save)
 
@@ -164,12 +175,18 @@ class SimpleConfig(PrintError):
                 out = self.user_config.get(key, default)
         return out
 
+    def _check_dependent_keys(self) -> None:
+        if self.get('serverfingerprint'):
+            if not self.get('server'):
+                raise Exception("config key 'serverfingerprint' requires 'server' to also be set")
+            self.make_key_not_modifiable('server')
+
     def requires_upgrade(self):
         return self.get_config_version() < FINAL_CONFIG_VERSION
 
     def upgrade(self):
         with self.lock:
-            self.print_error('upgrading config')
+            self.logger.info('upgrading config')
 
             self.convert_version_2()
             self.convert_version_3()
@@ -222,14 +239,20 @@ class SimpleConfig(PrintError):
     def get_config_version(self):
         config_version = self.get('config_version', 1)
         if config_version > FINAL_CONFIG_VERSION:
-            self.print_stderr('WARNING: config version ({}) is higher than ours ({})'
-                             .format(config_version, FINAL_CONFIG_VERSION))
+            self.logger.warning('config version ({}) is higher than latest ({})'
+                                .format(config_version, FINAL_CONFIG_VERSION))
         return config_version
 
-    def is_modifiable(self, key):
-        return key not in self.cmdline_options
+    def is_modifiable(self, key) -> bool:
+        return (key not in self.cmdline_options
+                and key not in self._not_modifiable_keys)
+
+    def make_key_not_modifiable(self, key) -> None:
+        self._not_modifiable_keys.add(key)
 
     def save_user_config(self):
+        if self.get('forget_config'):
+            return
         if not self.path:
             return
         path = os.path.join(self.path, "config")
@@ -243,17 +266,17 @@ class SimpleConfig(PrintError):
             if os.path.exists(self.path):  # or maybe not?
                 raise
 
-    def get_wallet_path(self):
+    def get_wallet_path(self, *, use_gui_last_wallet=False):
         """Set the path of the wallet."""
 
         # command line -w option
         if self.get('wallet_path'):
             return os.path.join(self.get('cwd', ''), self.get('wallet_path'))
 
-        # path in config file
-        path = self.get('default_wallet_path')
-        if path and os.path.exists(path):
-            return path
+        if use_gui_last_wallet:
+            path = self.get('gui_last_wallet')
+            if path and os.path.exists(path):
+                return path
 
         # default path
         util.assert_datadir_available(self.path)
@@ -276,17 +299,11 @@ class SimpleConfig(PrintError):
             self.set_key('recently_open', recent)
 
     def set_session_timeout(self, seconds):
-        self.print_error("session timeout -> %d seconds" % seconds)
+        self.logger.info(f"session timeout -> {seconds} seconds")
         self.set_key('session_timeout', seconds)
 
     def get_session_timeout(self):
         return self.get('session_timeout', 300)
-
-    def open_last_wallet(self):
-        if self.get('wallet_path') is None:
-            last_wallet = self.get('gui_last_wallet')
-            if last_wallet is not None and os.path.exists(last_wallet):
-                self.cmdline_options['default_wallet_path'] = last_wallet
 
     def save_last_wallet(self, wallet):
         if self.get('wallet_path') is None:
@@ -503,6 +520,8 @@ class SimpleConfig(PrintError):
 
         fee_level: float between 0.0 and 1.0, representing fee slider position
         """
+        if constants.net is constants.BitcoinRegtest:
+            return FEERATE_REGTEST_HARDCODED
         if dyn is None:
             dyn = self.is_dynfee()
         if mempool is None:
@@ -528,14 +547,20 @@ class SimpleConfig(PrintError):
         fee_per_kb = self.fee_per_kb()
         return fee_per_kb / 1000 if fee_per_kb is not None else None
 
-    def estimate_fee(self, size):
+    def estimate_fee(self, size: Union[int, float, Decimal], *,
+                     allow_fallback_to_static_rates: bool = False) -> int:
         fee_per_kb = self.fee_per_kb()
         if fee_per_kb is None:
-            raise NoDynamicFeeEstimates()
+            if allow_fallback_to_static_rates:
+                fee_per_kb = FEERATE_FALLBACK_STATIC_FEE
+            else:
+                raise NoDynamicFeeEstimates()
         return self.estimate_fee_for_feerate(fee_per_kb, size)
 
     @classmethod
-    def estimate_fee_for_feerate(cls, fee_per_kb, size):
+    def estimate_fee_for_feerate(cls, fee_per_kb: Union[int, float, Decimal],
+                                 size: Union[int, float, Decimal]) -> int:
+        size = Decimal(size)
         fee_per_kb = Decimal(fee_per_kb)
         fee_per_byte = fee_per_kb / 1000
         # to be consistent with what is displayed in the GUI,
@@ -563,6 +588,57 @@ class SimpleConfig(PrintError):
             device = ''
         return device
 
+    def get_ssl_context(self):
+        ssl_keyfile = self.get('ssl_keyfile')
+        ssl_certfile = self.get('ssl_certfile')
+        if ssl_keyfile and ssl_certfile:
+            ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            ssl_context.load_cert_chain(ssl_certfile, ssl_keyfile)
+            return ssl_context
+
+    def get_ssl_domain(self):
+        from .paymentrequest import check_ssl_config
+        if self.get('ssl_keyfile') and self.get('ssl_certfile'):
+            SSL_identity = check_ssl_config(self)
+        else:
+            SSL_identity = None
+        return SSL_identity
+
+    def get_netaddress(self, key: str) -> Optional[NetAddress]:
+        text = self.get(key)
+        if text:
+            try:
+                host, port = text.split(':')
+                return NetAddress(host, port)
+            except:
+                pass
+
+    def format_amount(self, x, is_diff=False, whitespaces=False):
+        return format_satoshis(
+            x,
+            num_zeros=self.num_zeros,
+            decimal_point=self.decimal_point,
+            is_diff=is_diff,
+            whitespaces=whitespaces,
+        )
+
+    def format_amount_and_units(self, amount):
+        return self.format_amount(amount) + ' '+ self.get_base_unit()
+
+    def format_fee_rate(self, fee_rate):
+        return format_fee_satoshis(fee_rate/1000, num_zeros=self.num_zeros) + ' sat/byte'
+
+    def get_base_unit(self):
+        return decimal_point_to_base_unit_name(self.decimal_point)
+
+    def set_base_unit(self, unit):
+        assert unit in base_units.keys()
+        self.decimal_point = base_unit_name_to_decimal_point(unit)
+        self.set_key('decimal_point', self.decimal_point, True)
+
+    def get_decimal_point(self):
+        return self.decimal_point
+
 
 def read_user_config(path):
     """Parse and store the user config settings in electrum.conf into user_config[]."""
@@ -576,7 +652,7 @@ def read_user_config(path):
             data = f.read()
         result = json.loads(data)
     except:
-        print_error("Warning: Cannot read config file.", config_path)
+        _logger.warning(f"Cannot read config file. {config_path}")
         return {}
     if not type(result) is dict:
         return {}

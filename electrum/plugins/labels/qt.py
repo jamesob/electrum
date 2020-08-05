@@ -1,6 +1,7 @@
 from functools import partial
 import traceback
 import sys
+from typing import TYPE_CHECKING
 
 from PyQt5.QtCore import QObject, pyqtSignal
 from PyQt5.QtWidgets import (QHBoxLayout, QLabel, QVBoxLayout)
@@ -11,6 +12,10 @@ from electrum.gui.qt.util import ThreadedButton, Buttons, EnterButton, WindowMod
 
 from .labels import LabelsPlugin
 
+if TYPE_CHECKING:
+    from electrum.gui.qt import ElectrumGui
+    from electrum.gui.qt.main_window import ElectrumWindow
+    from electrum.wallet import Abstract_Wallet
 
 class QLabelsSignalObject(QObject):
     labels_changed_signal = pyqtSignal(object)
@@ -21,6 +26,7 @@ class Plugin(LabelsPlugin):
     def __init__(self, *args):
         LabelsPlugin.__init__(self, *args)
         self.obj = QLabelsSignalObject()
+        self._init_qt_received = False
 
     def requires_settings(self):
         return True
@@ -58,15 +64,22 @@ class Plugin(LabelsPlugin):
     def done_processing_success(self, dialog, result):
         dialog.show_message(_("Your labels have been synchronised."))
 
-    def done_processing_error(self, dialog, result):
-        traceback.print_exception(*result, file=sys.stderr)
-        dialog.show_error(_("Error synchronising labels") + ':\n' + str(result[:2]))
+    def done_processing_error(self, dialog, exc_info):
+        self.logger.error("Error synchronising labels", exc_info=exc_info)
+        dialog.show_error(_("Error synchronising labels") + f':\n{repr(exc_info[1])}')
 
     @hook
-    def load_wallet(self, wallet, window):
-        # FIXME if the user just enabled the plugin, this hook won't be called
-        # as the wallet is already loaded, and hence the plugin will be in
-        # a non-functional state for that window
+    def init_qt(self, gui: 'ElectrumGui'):
+        if self._init_qt_received:  # only need/want the first signal
+            return
+        self._init_qt_received = True
+        # If the user just enabled the plugin, the 'load_wallet' hook would not
+        # get called for already loaded wallets, hence we call it manually for those:
+        for window in gui.windows:
+            self.load_wallet(window.wallet, window)
+
+    @hook
+    def load_wallet(self, wallet: 'Abstract_Wallet', window: 'ElectrumWindow'):
         self.obj.labels_changed_signal.connect(window.update_tabs)
         self.start_wallet(wallet)
 

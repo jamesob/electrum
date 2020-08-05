@@ -1,13 +1,21 @@
 from electrum.plugin import hook
-from .coldcard import ColdcardPlugin
-from electrum.util import print_msg, print_error, raw_input, print_stderr
+from electrum.util import print_msg, raw_input, print_stderr
+from electrum.logging import get_logger
 
-class ColdcardCmdLineHandler:
+from ..hw_wallet.cmdline import CmdLineHandler
+
+from .coldcard import ColdcardPlugin
+
+
+_logger = get_logger(__name__)
+
+
+class ColdcardCmdLineHandler(CmdLineHandler):
 
     def get_passphrase(self, msg, confirm):
         raise NotImplementedError
 
-    def get_pin(self, msg):
+    def get_pin(self, msg, *, show_strength=True):
         raise NotImplementedError
 
     def prompt_auth(self, msg):
@@ -20,14 +28,8 @@ class ColdcardCmdLineHandler:
     def stop(self):
         pass
 
-    def show_message(self, msg, on_cancel=None):
-        print_stderr(msg)
-
-    def show_error(self, msg, blocking=False):
-        print_error(msg)
-
     def update_status(self, b):
-        print_error('hw device status', b)
+        _logger.info(f'hw device status {b}')
 
     def finished(self):
         pass

@@ -22,6 +22,7 @@
 # SOFTWARE.
 import os
 import threading
+import time
 from typing import Optional, Dict, Mapping, Sequence
 
 from . import util
@@ -30,7 +31,10 @@ from .crypto import sha256d
 from . import constants
 from .util import bfh, bh2u
 from .simple_config import SimpleConfig
+from .logging import get_logger, Logger
 
+
+_logger = get_logger(__name__)
 
 HEADER_SIZE = 80  # bytes
 MAX_TARGET = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
@@ -96,7 +100,7 @@ def read_blockchains(config: 'SimpleConfig'):
     if best_chain.height() > constants.net.max_checkpoint():
         header_after_cp = best_chain.read_header(constants.net.max_checkpoint()+1)
         if not header_after_cp or not best_chain.can_connect(header_after_cp, check_height=False):
-            util.print_error("[blockchain] deleting best chain. cannot connect header after last cp to last cp.")
+            _logger.info("[blockchain] deleting best chain. cannot connect header after last cp to last cp.")
             os.unlink(best_chain.path())
             best_chain.update_size()
     # forks
@@ -107,7 +111,7 @@ def read_blockchains(config: 'SimpleConfig'):
     l = sorted(l, key=lambda x: int(x.split('_')[1]))  # sort by forkpoint
 
     def delete_chain(filename, reason):
-        util.print_error(f"[blockchain] deleting chain {filename}: {reason}")
+        _logger.info(f"[blockchain] deleting chain {filename}: {reason}")
         os.unlink(os.path.join(fdir, filename))
 
     def instantiate_chain(filename):
@@ -156,7 +160,21 @@ _CHAINWORK_CACHE = {
 }  # type: Dict[str, int]
 
 
-class Blockchain(util.PrintError):
+def init_headers_file_for_best_chain():
+    b = get_best_chain()
+    filename = b.path()
+    length = HEADER_SIZE * len(constants.net.CHECKPOINTS) * 2016
+    if not os.path.exists(filename) or os.path.getsize(filename) < length:
+        with open(filename, 'wb') as f:
+            if length > 0:
+                f.seek(length - 1)
+                f.write(b'\x00')
+        util.ensure_sparse_file(filename)
+    with b.lock:
+        b.update_size()
+
+
+class Blockchain(Logger):
     """
     Manages blockchain headers and their verification
     """
@@ -168,6 +186,7 @@ class Blockchain(util.PrintError):
         # assert (parent is None) == (forkpoint == 0)
         if 0 < forkpoint <= constants.net.max_checkpoint():
             raise Exception(f"cannot fork below max checkpoint. forkpoint: {forkpoint}")
+        Logger.__init__(self)
         self.config = config
         self.forkpoint = forkpoint  # height of first header
         self.parent = parent
@@ -254,6 +273,7 @@ class Blockchain(util.PrintError):
                           parent=parent,
                           forkpoint_hash=hash_header(header),
                           prev_hash=parent.get_hash(forkpoint-1))
+        self.assert_headers_file_available(parent.path())
         open(self.path(), 'w+').close()
         self.save_header(header)
         # put into global dict. note that in some cases
@@ -368,7 +388,7 @@ class Blockchain(util.PrintError):
             return False
         if self.parent.get_chainwork() >= self.get_chainwork():
             return False
-        self.print_error("swap", self.forkpoint, self.parent.forkpoint)
+        self.logger.info(f"swapping {self.forkpoint} {self.parent.forkpoint}")
         parent_branch_size = self.parent.height() - self.forkpoint + 1
         forkpoint = self.forkpoint  # type: Optional[int]
         parent = self.parent  # type: Optional[Blockchain]
@@ -464,6 +484,20 @@ class Blockchain(util.PrintError):
         """Return latest header."""
         height = self.height()
         return self.read_header(height)
+
+    def is_tip_stale(self) -> bool:
+        STALE_DELAY = 8 * 60 * 60  # in seconds
+        header = self.header_at_tip()
+        if not header:
+            return True
+        # note: We check the timestamp only in the latest header.
+        #       The Bitcoin consensus has a lot of leeway here:
+        #       - needs to be greater than the median of the timestamps of the past 11 blocks, and
+        #       - up to at most 2 hours into the future compared to local clock
+        #       so there is ~2 hours of leeway in either direction
+        if header['timestamp'] + STALE_DELAY < time.time():
+            return True
+        return False
 
     def get_hash(self, height: int) -> str:
         def is_height_checkpoint():
@@ -570,7 +604,6 @@ class Blockchain(util.PrintError):
             return False
         height = header['block_height']
         if check_height and self.height() != height - 1:
-            #self.print_error("cannot connect at height", height)
             return False
         if height == 0:
             return hash_header(header) == constants.net.GENESIS
@@ -595,11 +628,10 @@ class Blockchain(util.PrintError):
         try:
             data = bfh(hexdata)
             self.verify_chunk(idx, data)
-            #self.print_error("validated chunk %d" % idx)
             self.save_chunk(idx, data)
             return True
         except BaseException as e:
-            self.print_error(f'verify_chunk idx {idx} failed: {repr(e)}')
+            self.logger.info(f'verify_chunk idx {idx} failed: {repr(e)}')
             return False
 
     def get_checkpoints(self):
@@ -614,6 +646,7 @@ class Blockchain(util.PrintError):
 
 
 def check_header(header: dict) -> Optional[Blockchain]:
+    """Returns any Blockchain that contains header, or None."""
     if type(header) is not dict:
         return None
     with blockchains_lock: chains = list(blockchains.values())
@@ -624,8 +657,20 @@ def check_header(header: dict) -> Optional[Blockchain]:
 
 
 def can_connect(header: dict) -> Optional[Blockchain]:
+    """Returns the Blockchain that has a tip that directly links up
+    with header, or None.
+    """
     with blockchains_lock: chains = list(blockchains.values())
     for b in chains:
         if b.can_connect(header):
             return b
     return None
+
+
+def get_chains_that_contain_header(height: int, header_hash: str) -> Sequence[Blockchain]:
+    """Returns a list of Blockchains that contain header, best chain first."""
+    with blockchains_lock: chains = list(blockchains.values())
+    chains = [chain for chain in chains
+              if chain.check_hash(height=height, header_hash=header_hash)]
+    chains = sorted(chains, key=lambda x: x.get_chainwork(), reverse=True)
+    return chains
